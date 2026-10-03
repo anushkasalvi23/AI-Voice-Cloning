@@ -14,6 +14,13 @@ TARGET_RMS_DBFS = -20.0
 MAX_TEXT_CHARS = 1000
 GENERATED_TTL_HOURS = 24
 
+SESSION_COOKIE = "eva_session"
+SESSION_TTL_SECONDS = 7 * 24 * 3600
+COOKIE_SECURE = os.environ.get("VC_COOKIE_SECURE") == "1"  # set when serving over HTTPS
+# Google sign-in is off until both are set (OAuth "Web application" client from Google Cloud Console).
+GOOGLE_CLIENT_ID = os.environ.get("VC_GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("VC_GOOGLE_CLIENT_SECRET", "")
+
 # Set VC_FAKE_ENGINE=1 to run the API without a GPU/model (used by tests).
 FAKE_ENGINE = os.environ.get("VC_FAKE_ENGINE") == "1"
 MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"

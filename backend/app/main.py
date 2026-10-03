@@ -6,15 +6,15 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import audio, config, db
+from .auth import current_user, router as auth_router
 from .engine import load_engine
 
-USER_ID = "local"  # single-user MVP; swap for real auth if multi-tenant is ever needed
 state = {}
 
 
@@ -81,6 +81,7 @@ app.add_middleware(
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"], allow_headers=["*"],
 )
+app.include_router(auth_router)
 
 
 @app.get("/health")
@@ -95,6 +96,7 @@ async def create_voice(
     language: str = Form("en"),
     consent: bool = Form(False),
     file: UploadFile = File(...),
+    user=Depends(current_user),
 ):
     if not consent:
         raise HTTPException(400, "Consent to clone this voice is required")
@@ -126,15 +128,15 @@ async def create_voice(
     with db.conn() as c:
         c.execute(
             "INSERT INTO voices (id, user_id, name, language, duration, consent_at) VALUES (?,?,?,?,?,?)",
-            (voice_id, USER_ID, name.strip(), language, duration, now),
+            (voice_id, user["id"], name.strip(), language, duration, now),
         )
     return {"id": voice_id, "name": name.strip(), "language": language, "duration": duration, "consent_at": now}
 
 
 @app.get("/voices")
-def list_voices():
+def list_voices(user=Depends(current_user)):
     with db.conn() as c:
-        rows = c.execute("SELECT * FROM voices WHERE user_id=? ORDER BY created_at DESC", (USER_ID,)).fetchall()
+        rows = c.execute("SELECT * FROM voices WHERE user_id=? ORDER BY created_at DESC", (user["id"],)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -143,29 +145,31 @@ class VoiceUpdate(BaseModel):
 
 
 @app.patch("/voices/{voice_id}")
-def rename_voice(voice_id: str, body: VoiceUpdate):
+def rename_voice(voice_id: str, body: VoiceUpdate, user=Depends(current_user)):
     with db.conn() as c:
-        cur = c.execute("UPDATE voices SET name=? WHERE id=? AND user_id=?", (body.name.strip(), voice_id, USER_ID))
+        cur = c.execute("UPDATE voices SET name=? WHERE id=? AND user_id=?", (body.name.strip(), voice_id, user["id"]))
         if cur.rowcount == 0:
             raise HTTPException(404, "Voice not found")
     return {"id": voice_id, "name": body.name.strip()}
 
 
 @app.delete("/voices/{voice_id}", status_code=204)
-def delete_voice(voice_id: str):
+def delete_voice(voice_id: str, user=Depends(current_user)):
     with db.conn() as c:
-        cur = c.execute("DELETE FROM voices WHERE id=? AND user_id=?", (voice_id, USER_ID))
+        cur = c.execute("DELETE FROM voices WHERE id=? AND user_id=?", (voice_id, user["id"]))
         if cur.rowcount == 0:
             raise HTTPException(404, "Voice not found")
     shutil.rmtree(_voice_dir(voice_id), ignore_errors=True)
 
 
 @app.get("/voices/{voice_id}/audio")
-def voice_reference(voice_id: str):
+def voice_reference(voice_id: str, user=Depends(current_user)):
     if not voice_id.isalnum():
         raise HTTPException(400, "Bad id")
+    with db.conn() as c:
+        owned = c.execute("SELECT 1 FROM voices WHERE id=? AND user_id=?", (voice_id, user["id"])).fetchone()
     p = _voice_dir(voice_id) / "reference.wav"
-    if not p.exists():
+    if owned is None or not p.exists():
         raise HTTPException(404, "Voice not found")
     return FileResponse(p, media_type="audio/wav")
 
@@ -177,20 +181,20 @@ class GenerateRequest(BaseModel):
     language: str = "en"
 
 
-def _check_request(req: GenerateRequest):
+def _check_request(req: GenerateRequest, user_id: str):
     if not req.text.strip():
         raise HTTPException(422, "Text is empty")
     if req.language not in config.LANGUAGES:
         raise HTTPException(400, f"Unsupported language '{req.language}'")
     with db.conn() as c:
-        v = c.execute("SELECT 1 FROM voices WHERE id=? AND user_id=?", (req.voice_id, USER_ID)).fetchone()
+        v = c.execute("SELECT 1 FROM voices WHERE id=? AND user_id=?", (req.voice_id, user_id)).fetchone()
     if v is None:
         raise HTTPException(404, "Voice not found")
 
 
 @app.post("/generate", status_code=202)
-async def generate(req: GenerateRequest):
-    _check_request(req)
+async def generate(req: GenerateRequest, user=Depends(current_user)):
+    _check_request(req, user["id"])
     job_id = _new_id()
     with db.conn() as c:
         c.execute("INSERT INTO jobs (id, voice_id, text, language) VALUES (?,?,?,?)",
@@ -200,9 +204,10 @@ async def generate(req: GenerateRequest):
 
 
 @app.get("/jobs/{job_id}")
-def get_job(job_id: str):
+def get_job(job_id: str, user=Depends(current_user)):
     with db.conn() as c:
-        j = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        j = c.execute("SELECT j.* FROM jobs j JOIN voices v ON v.id = j.voice_id WHERE j.id=? AND v.user_id=?",
+                      (job_id, user["id"])).fetchone()
     if j is None:
         raise HTTPException(404, "Job not found")
     return {"id": j["id"], "status": j["status"], "error": j["error"], "audio_id": j["result_id"],
@@ -210,11 +215,14 @@ def get_job(job_id: str):
 
 
 @app.get("/audio/{audio_id}")
-def get_audio(audio_id: str):
+def get_audio(audio_id: str, user=Depends(current_user)):
     if not audio_id.isalnum():
         raise HTTPException(400, "Bad id")
+    with db.conn() as c:
+        owned = c.execute("SELECT 1 FROM jobs j JOIN voices v ON v.id = j.voice_id WHERE j.result_id=? AND v.user_id=?",
+                          (audio_id, user["id"])).fetchone()
     p = config.GENERATED_DIR / f"{audio_id}.wav"
-    if not p.exists():
+    if owned is None or not p.exists():
         raise HTTPException(404, "Audio not found (may have expired)")
     return FileResponse(p, media_type="audio/wav", filename=f"voice-{audio_id[:8]}.wav")
 
@@ -227,9 +235,9 @@ def _wav_header(sr: int) -> bytes:
 
 
 @app.post("/generate/stream")
-async def generate_stream(req: GenerateRequest):
+async def generate_stream(req: GenerateRequest, user=Depends(current_user)):
     """Stretch goal: chunked inference, audio starts arriving before synthesis finishes."""
-    _check_request(req)
+    _check_request(req, user["id"])
     emb = _voice_dir(req.voice_id) / "embedding.pt"
     loop = asyncio.get_running_loop()
 
