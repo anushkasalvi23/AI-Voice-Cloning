@@ -1,0 +1,9 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+numpy
+soundfile
+coqui-tts>=0.24
+transformers>=4.43,<5   # coqui-tts breaks on transformers 5.x
+pytest
+httpx

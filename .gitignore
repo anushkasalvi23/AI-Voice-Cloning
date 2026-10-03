@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Frontend
+node_modules/
+dist/
+
+# App data (voice recordings, embeddings, generated audio, SQLite DB) - contains personal voice data
+data/
+
+# Scratch / logs / phase 1 script outputs
+*.log
+phase1_*.wav
+phase1_*.pt
+
+# Model weights (downloaded automatically on first run)
+*.pth
+*.safetensors
+
+# Env / OS / IDE
+.env
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
