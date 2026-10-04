@@ -90,7 +90,7 @@ Create a `.env` file in each folder (see the table below).
 
 ```bash
 # Backend (from /backend)
-uvicorn main:app --reload
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 # Frontend (from /frontend)
 npm run dev
@@ -175,3 +175,25 @@ XTTS-v2 is distributed under the **Coqui Public Model License (CPML)**, which re
 - [Clerk](https://clerk.com)
 - [MongoDB Atlas](https://www.mongodb.com/atlas)
 - [FastAPI](https://fastapi.tiangolo.com)
+
+---
+
+## Screenshots
+
+### Home
+
+![Eva home page](Screenshots/Home-page.png)
+
+### Login
+
+![Eva login page](Screenshots/Login-page.png)
+
+### Dashboard
+
+![Eva dashboard 1](Screenshots/Dashboard-1.png)
+
+![Eva dashboard 2](Screenshots/Dashboard-2.png)
+
+![Eva dashboard 3](Screenshots/Dashboard-3.png)
+
+![Eva dashboard 4](Screenshots/Dashboard-4.png)

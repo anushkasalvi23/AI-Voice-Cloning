@@ -17,10 +17,19 @@ class Engine:
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = TTS(config.MODEL_NAME).to(self.device).synthesizer.tts_model
+        # model.inference()/get_conditioning_latents() carry their own defaults (e.g. repetition_penalty=10),
+        # which differ from the settings Coqui tunes for XTTS-v2 and apply only through model.synthesize().
+        # A penalty that high makes the decoder avoid repeated sounds, so it stutters and drops words.
+        c = self.model.config
+        self.voice_settings = {"gpt_cond_len": c.gpt_cond_len, "gpt_cond_chunk_len": c.gpt_cond_chunk_len,
+                               "max_ref_length": c.max_ref_len, "sound_norm_refs": c.sound_norm_refs}
+        self.gen_settings = {"temperature": c.temperature, "length_penalty": c.length_penalty,
+                             "repetition_penalty": c.repetition_penalty, "top_k": c.top_k, "top_p": c.top_p}
 
     def embed(self, wav_path: Path, out_path: Path):
         """Compute and cache the speaker conditioning latents for a reference clip."""
-        gpt_cond, spk = self.model.get_conditioning_latents(audio_path=[str(wav_path)])
+        gpt_cond, spk = self.model.get_conditioning_latents(
+            audio_path=[str(wav_path)], **self.voice_settings)
         self.torch.save({"gpt_cond_latent": gpt_cond.cpu(), "speaker_embedding": spk.cpu()}, out_path)
 
     def _load(self, emb_path: Path):
@@ -30,13 +39,14 @@ class Engine:
     def synthesize(self, text: str, language: str, emb_path: Path) -> np.ndarray:
         gpt_cond, spk = self._load(emb_path)
         with self.torch.inference_mode():
-            out = self.model.inference(text, language, gpt_cond, spk, enable_text_splitting=True)
+            out = self.model.inference(text, language, gpt_cond, spk, enable_text_splitting=True, **self.gen_settings)
         return np.asarray(out["wav"], dtype=np.float32)
 
     def stream(self, text: str, language: str, emb_path: Path) -> Iterator[np.ndarray]:
         gpt_cond, spk = self._load(emb_path)
         with self.torch.inference_mode():
-            for chunk in self.model.inference_stream(text, language, gpt_cond, spk, enable_text_splitting=True):
+            for chunk in self.model.inference_stream(
+                    text, language, gpt_cond, spk, enable_text_splitting=True, **self.gen_settings):
                 yield chunk.cpu().numpy().astype(np.float32)
 
     def free_cache(self):
