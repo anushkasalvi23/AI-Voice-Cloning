@@ -26,3 +26,6 @@ phase1_*.pt
 Thumbs.db
 .vscode/
 .idea/
+
+# OAuth client secrets downloaded from Google Cloud Console
+client_secret_*.json

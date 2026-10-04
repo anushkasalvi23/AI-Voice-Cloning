@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import audio, config, db
-from .auth import current_user, router as auth_router
+from .auth import current_user
 from .engine import load_engine
 
 state = {}
@@ -26,17 +26,23 @@ def _voice_dir(voice_id):
     return config.VOICES_DIR / voice_id
 
 
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _public(doc) -> dict:
+    return {"id": doc["_id"], **{k: v for k, v in doc.items() if k != "_id"}}
+
+
 async def worker():
     """Single GPU worker: jobs run one at a time so requests never collide on the card."""
     loop = asyncio.get_running_loop()
     while True:
         job_id = await state["queue"].get()
         try:
-            with db.conn() as c:
-                job = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-                if job is None:  # voice deleted while queued
-                    continue
-                c.execute("UPDATE jobs SET status='running' WHERE id=?", (job_id,))
+            job = await asyncio.to_thread(db.jobs.find_one_and_update, {"_id": job_id}, {"$set": {"status": "running"}})
+            if job is None:  # voice deleted while queued
+                continue
             emb = _voice_dir(job["voice_id"]) / "embedding.pt"
             t0 = time.perf_counter()
             wav = await loop.run_in_executor(None, state["engine"].synthesize, job["text"], job["language"], emb)
@@ -44,12 +50,13 @@ async def worker():
             audio.write_wav(config.GENERATED_DIR / f"{result_id}.wav", wav)
             print(f"[job {job_id[:8]}] {len(job['text'])} chars -> "
                   f"{len(wav) / config.SAMPLE_RATE:.1f}s audio in {time.perf_counter() - t0:.2f}s")
-            with db.conn() as c:
-                c.execute("UPDATE jobs SET status='done', result_id=? WHERE id=?", (result_id, job_id))
+            await asyncio.to_thread(db.jobs.update_one, {"_id": job_id}, {"$set": {
+                "status": "done", "result_id": result_id, "filename": f"{result_id}.wav",
+                "audio_url": f"/audio/{result_id}", "completed_at": _now()}})
         except Exception as e:  # noqa: BLE001 - surface any failure on the job row
             msg = "GPU out of memory; try shorter text" if "out of memory" in str(e).lower() else str(e)
-            with db.conn() as c:
-                c.execute("UPDATE jobs SET status='failed', error=? WHERE id=?", (msg, job_id))
+            await asyncio.to_thread(db.jobs.update_one, {"_id": job_id},
+                                    {"$set": {"status": "failed", "error": msg, "completed_at": _now()}})
             state["engine"].free_cache()
 
 
@@ -66,10 +73,10 @@ async def lifespan(app: FastAPI):
     cleanup_generated()
     state["engine"] = load_engine()  # loaded once, resident for process lifetime
     state["queue"] = asyncio.Queue()
-    with db.conn() as c:  # re-queue anything interrupted by a restart
-        c.execute("UPDATE jobs SET status='queued' WHERE status='running'")
-        for r in c.execute("SELECT id FROM jobs WHERE status='queued' ORDER BY created_at"):
-            state["queue"].put_nowait(r["id"])
+    # re-queue anything interrupted by a restart
+    db.jobs.update_many({"status": "running"}, {"$set": {"status": "queued"}})
+    for j in db.jobs.find({"status": "queued"}, {"_id": 1}).sort("created_at", 1):
+        state["queue"].put_nowait(j["_id"])
     task = asyncio.create_task(worker())
     yield
     task.cancel()
@@ -78,10 +85,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Voice Cloning App", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=config.FRONTEND_ORIGINS,
     allow_methods=["*"], allow_headers=["*"],
 )
-app.include_router(auth_router)
 
 
 @app.get("/health")
@@ -96,7 +102,7 @@ async def create_voice(
     language: str = Form("en"),
     consent: bool = Form(False),
     file: UploadFile = File(...),
-    user=Depends(current_user),
+    user_id: str = Depends(current_user),
 ):
     if not consent:
         raise HTTPException(400, "Consent to clone this voice is required")
@@ -123,21 +129,19 @@ async def create_voice(
         shutil.rmtree(vdir, ignore_errors=True)
         raise HTTPException(500, f"Failed to extract speaker embedding: {e}")
 
-    now = datetime.now(timezone.utc).isoformat()
-    duration = len(wav) / config.SAMPLE_RATE
-    with db.conn() as c:
-        c.execute(
-            "INSERT INTO voices (id, user_id, name, language, duration, consent_at) VALUES (?,?,?,?,?,?)",
-            (voice_id, user["id"], name.strip(), language, duration, now),
-        )
-    return {"id": voice_id, "name": name.strip(), "language": language, "duration": duration, "consent_at": now}
+    now = _now()
+    voice = {
+        "_id": voice_id, "user_id": user_id, "name": name.strip(), "language": language,
+        "duration": len(wav) / config.SAMPLE_RATE, "filename": file.filename or "",
+        "audio_url": f"/voices/{voice_id}/audio", "consent_at": now, "created_at": now,
+    }
+    await asyncio.to_thread(db.voices.insert_one, voice)
+    return _public(voice)
 
 
 @app.get("/voices")
-def list_voices(user=Depends(current_user)):
-    with db.conn() as c:
-        rows = c.execute("SELECT * FROM voices WHERE user_id=? ORDER BY created_at DESC", (user["id"],)).fetchall()
-    return [dict(r) for r in rows]
+def list_voices(user_id: str = Depends(current_user)):
+    return [_public(v) for v in db.voices.find({"user_id": user_id}).sort("created_at", -1)]
 
 
 class VoiceUpdate(BaseModel):
@@ -145,29 +149,26 @@ class VoiceUpdate(BaseModel):
 
 
 @app.patch("/voices/{voice_id}")
-def rename_voice(voice_id: str, body: VoiceUpdate, user=Depends(current_user)):
-    with db.conn() as c:
-        cur = c.execute("UPDATE voices SET name=? WHERE id=? AND user_id=?", (body.name.strip(), voice_id, user["id"]))
-        if cur.rowcount == 0:
-            raise HTTPException(404, "Voice not found")
+def rename_voice(voice_id: str, body: VoiceUpdate, user_id: str = Depends(current_user)):
+    res = db.voices.update_one({"_id": voice_id, "user_id": user_id}, {"$set": {"name": body.name.strip()}})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Voice not found")
     return {"id": voice_id, "name": body.name.strip()}
 
 
 @app.delete("/voices/{voice_id}", status_code=204)
-def delete_voice(voice_id: str, user=Depends(current_user)):
-    with db.conn() as c:
-        cur = c.execute("DELETE FROM voices WHERE id=? AND user_id=?", (voice_id, user["id"]))
-        if cur.rowcount == 0:
-            raise HTTPException(404, "Voice not found")
+def delete_voice(voice_id: str, user_id: str = Depends(current_user)):
+    if db.voices.delete_one({"_id": voice_id, "user_id": user_id}).deleted_count == 0:
+        raise HTTPException(404, "Voice not found")
+    db.jobs.delete_many({"voice_id": voice_id})
     shutil.rmtree(_voice_dir(voice_id), ignore_errors=True)
 
 
 @app.get("/voices/{voice_id}/audio")
-def voice_reference(voice_id: str, user=Depends(current_user)):
+def voice_reference(voice_id: str, user_id: str = Depends(current_user)):
     if not voice_id.isalnum():
         raise HTTPException(400, "Bad id")
-    with db.conn() as c:
-        owned = c.execute("SELECT 1 FROM voices WHERE id=? AND user_id=?", (voice_id, user["id"])).fetchone()
+    owned = db.voices.find_one({"_id": voice_id, "user_id": user_id}, {"_id": 1})
     p = _voice_dir(voice_id) / "reference.wav"
     if owned is None or not p.exists():
         raise HTTPException(404, "Voice not found")
@@ -186,41 +187,37 @@ def _check_request(req: GenerateRequest, user_id: str):
         raise HTTPException(422, "Text is empty")
     if req.language not in config.LANGUAGES:
         raise HTTPException(400, f"Unsupported language '{req.language}'")
-    with db.conn() as c:
-        v = c.execute("SELECT 1 FROM voices WHERE id=? AND user_id=?", (req.voice_id, user_id)).fetchone()
-    if v is None:
+    if db.voices.find_one({"_id": req.voice_id, "user_id": user_id}, {"_id": 1}) is None:
         raise HTTPException(404, "Voice not found")
 
 
 @app.post("/generate", status_code=202)
-async def generate(req: GenerateRequest, user=Depends(current_user)):
-    _check_request(req, user["id"])
+async def generate(req: GenerateRequest, user_id: str = Depends(current_user)):
+    await asyncio.to_thread(_check_request, req, user_id)
     job_id = _new_id()
-    with db.conn() as c:
-        c.execute("INSERT INTO jobs (id, voice_id, text, language) VALUES (?,?,?,?)",
-                  (job_id, req.voice_id, req.text.strip(), req.language))
+    await asyncio.to_thread(db.jobs.insert_one, {
+        "_id": job_id, "user_id": user_id, "voice_id": req.voice_id, "text": req.text.strip(),
+        "language": req.language, "status": "queued", "error": None, "result_id": None,
+        "filename": None, "audio_url": None, "created_at": _now(), "completed_at": None,
+    })
     await state["queue"].put(job_id)
     return {"job_id": job_id, "status": "queued"}
 
 
 @app.get("/jobs/{job_id}")
-def get_job(job_id: str, user=Depends(current_user)):
-    with db.conn() as c:
-        j = c.execute("SELECT j.* FROM jobs j JOIN voices v ON v.id = j.voice_id WHERE j.id=? AND v.user_id=?",
-                      (job_id, user["id"])).fetchone()
+def get_job(job_id: str, user_id: str = Depends(current_user)):
+    j = db.jobs.find_one({"_id": job_id, "user_id": user_id})
     if j is None:
         raise HTTPException(404, "Job not found")
-    return {"id": j["id"], "status": j["status"], "error": j["error"], "audio_id": j["result_id"],
+    return {"id": j["_id"], "status": j["status"], "error": j["error"], "audio_id": j["result_id"],
             "position": state["queue"].qsize() if j["status"] == "queued" else 0}
 
 
 @app.get("/audio/{audio_id}")
-def get_audio(audio_id: str, user=Depends(current_user)):
+def get_audio(audio_id: str, user_id: str = Depends(current_user)):
     if not audio_id.isalnum():
         raise HTTPException(400, "Bad id")
-    with db.conn() as c:
-        owned = c.execute("SELECT 1 FROM jobs j JOIN voices v ON v.id = j.voice_id WHERE j.result_id=? AND v.user_id=?",
-                          (audio_id, user["id"])).fetchone()
+    owned = db.jobs.find_one({"result_id": audio_id, "user_id": user_id}, {"_id": 1})
     p = config.GENERATED_DIR / f"{audio_id}.wav"
     if owned is None or not p.exists():
         raise HTTPException(404, "Audio not found (may have expired)")
@@ -235,10 +232,10 @@ def _wav_header(sr: int) -> bytes:
 
 
 @app.post("/generate/stream")
-async def generate_stream(req: GenerateRequest, user=Depends(current_user)):
+async def generate_stream(req: GenerateRequest, user_id: str = Depends(current_user)):
     """Stretch goal: chunked inference, audio starts arriving before synthesis finishes."""
-    _check_request(req, user["id"])
-    emb = _voice_dir(req.voice_id) / "embedding.pt"
+    await asyncio.to_thread(_check_request, req, user_id)
+    emb =_voice_dir(req.voice_id) / "embedding.pt"
     loop = asyncio.get_running_loop()
 
     async def body():

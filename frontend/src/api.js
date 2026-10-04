@@ -1,14 +1,31 @@
+import { getToken } from "@clerk/react";
+
 const BASE = "/api";
 
-async function request(path, opts) {
-  const res = await fetch(BASE + path, opts);
+async function request(path, opts = {}) {
+  let res;
+  try {
+    // Clerk session tokens live about a minute; getToken returns a fresh one (null when signed out).
+    const token = await getToken();
+    res = await fetch(BASE + path, { ...opts, headers: { ...opts.headers, ...(token && { Authorization: `Bearer ${token}` }) } });
+  } catch {
+    throw new Error("Cannot reach the server. Check your connection and try again.");
+  }
   if (!res.ok) {
-    let detail = res.statusText;
+    let detail = res.status >= 500 ? "Server error. Is the backend running?" : res.statusText;
+    let fields;
     try {
       const body = await res.json();
-      detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      if (Array.isArray(body.detail)) {
+        // FastAPI validation errors: [{loc: ["body", field], msg}]
+        fields = Object.fromEntries(body.detail.map((d) => [d.loc[d.loc.length - 1], d.msg.replace(/^Value error, /, "")]));
+        detail = Object.values(fields).join(". ");
+      } else if (typeof body.detail === "string") detail = body.detail;
     } catch {}
-    throw new Error(detail);
+    const err = new Error(detail);
+    err.status = res.status;
+    err.fields = fields;
+    throw err;
   }
   return res.status === 204 ? null : res.json();
 }
@@ -34,6 +51,8 @@ export const api = {
   deleteVoice: (id) => request(`/voices/${id}`, { method: "DELETE" }),
   generate: (voice_id, text, language) => request("/generate", json("POST", { voice_id, text, language })),
   job: (id) => request(`/jobs/${id}`),
+  // Used as <audio src> / download links, which cannot send the header; the backend accepts
+  // Clerk's same-origin __session cookie for these GETs.
   audioUrl: (id) => `${BASE}/audio/${id}`,
   voiceAudioUrl: (id) => `${BASE}/voices/${id}/audio`,
 };

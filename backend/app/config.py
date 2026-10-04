@@ -1,10 +1,13 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")  # backend/.env; real env vars win
+
 DATA_DIR = Path(os.environ.get("VC_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
 VOICES_DIR = DATA_DIR / "voices"
 GENERATED_DIR = DATA_DIR / "generated"
-DB_PATH = DATA_DIR / "app.db"
 
 SAMPLE_RATE = 24000          # XTTS-v2 native rate
 MIN_CLIP_SECONDS = 3.0
@@ -14,12 +17,23 @@ TARGET_RMS_DBFS = -20.0
 MAX_TEXT_CHARS = 1000
 GENERATED_TTL_HOURS = 24
 
-SESSION_COOKIE = "eva_session"
-SESSION_TTL_SECONDS = 7 * 24 * 3600
-COOKIE_SECURE = os.environ.get("VC_COOKIE_SECURE") == "1"  # set when serving over HTTPS
-# Google sign-in is off until both are set (OAuth "Web application" client from Google Cloud Console).
-GOOGLE_CLIENT_ID = os.environ.get("VC_GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.environ.get("VC_GOOGLE_CLIENT_SECRET", "")
+
+def _required(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} is not set. Copy backend/.env.example to backend/.env and fill it in.")
+    return value
+
+
+# Clerk: session tokens are verified against the instance's public keys (JWKS).
+CLERK_JWKS_URL = _required("CLERK_JWKS_URL")
+CLERK_ISSUER = CLERK_JWKS_URL.removesuffix("/.well-known/jwks.json")
+# Origins the frontend is served from: allowed by CORS and accepted as a token's `azp`.
+FRONTEND_ORIGINS = [o.strip() for o in os.environ.get(
+    "VC_FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if o.strip()]
+
+MONGODB_URI = _required("MONGODB_URI")
+DATABASE_NAME = _required("DATABASE_NAME")
 
 # Set VC_FAKE_ENGINE=1 to run the API without a GPU/model (used by tests).
 FAKE_ENGINE = os.environ.get("VC_FAKE_ENGINE") == "1"

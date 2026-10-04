@@ -1,12 +1,19 @@
 import io
 import time
+from types import SimpleNamespace
 
+import jwt
 import numpy as np
 import pytest
 import soundfile as sf
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
+from app import auth, config, db
 from app.main import app
+
+CLERK_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+OTHER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
 def wav_bytes(seconds=5.0, amp=0.3, sr=24000):
@@ -16,14 +23,30 @@ def wav_bytes(seconds=5.0, amp=0.3, sr=24000):
     return buf.getvalue()
 
 
-ACCOUNT = {"name": "Test User", "email": "Test@Example.com", "phone": "+919876543210", "password": "Str0ng!Passw0rd"}
+def token(sub="user_one", key=CLERK_KEY, **claims):
+    """A session token shaped like Clerk's: RS256, iss = the instance, azp = the frontend origin."""
+    now = int(time.time())
+    payload = {"sub": sub, "iss": config.CLERK_ISSUER, "azp": config.FRONTEND_ORIGINS[0],
+               "iat": now, "nbf": now, "exp": now + 3600, **claims}
+    return jwt.encode({k: v for k, v in payload.items() if v is not None}, key, algorithm="RS256")
+
+
+def bearer(*args, **kwargs):
+    return {"Authorization": f"Bearer {token(*args, **kwargs)}"}
+
+
+@pytest.fixture(autouse=True, scope="module")
+def clerk_keys():
+    # Stand in for the JWKS fetch; the signature and claims are still verified for real.
+    mp = pytest.MonkeyPatch()
+    mp.setattr(auth._jwks, "get_signing_key_from_jwt", lambda t: SimpleNamespace(key=CLERK_KEY.public_key()))
+    yield
+    mp.undo()
 
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app) as c:
-        r = c.post("/auth/signup", json=ACCOUNT)
-        assert r.status_code == 201, r.text
+    with TestClient(app, headers=bearer()) as c:
         yield c
 
 
@@ -52,8 +75,10 @@ def test_voice_lifecycle_and_generate(client):
     r = upload(client, wav_bytes())
     assert r.status_code == 201, r.text
     vid = r.json()["id"]
-    assert any(v["id"] == vid for v in client.get("/voices").json())
+    listed = next(v for v in client.get("/voices").json() if v["id"] == vid)
+    assert listed["created_at"][:4].isdigit() and listed["duration"] > 4
     assert client.patch(f"/voices/{vid}", json={"name": "Renamed"}).status_code == 200
+    assert client.get(f"/voices/{vid}/audio").status_code == 200
 
     job = client.post("/generate", json={"voice_id": vid, "text": "Hello there", "language": "en"})
     assert job.status_code == 202
@@ -66,11 +91,21 @@ def test_voice_lifecycle_and_generate(client):
     assert j["status"] == "done", j
     assert client.get(f"/audio/{j['audio_id']}").status_code == 200
 
+    # metadata for both the upload and the generated clip is stored against the Clerk user
+    voice = db.voices.find_one({"_id": vid})
+    assert voice["user_id"] == "user_one" and voice["filename"] == "a.wav" and voice["name"] == "Renamed"
+    assert voice["audio_url"] == f"/voices/{vid}/audio" and voice["created_at"] is not None
+    stored = db.jobs.find_one({"_id": jid})
+    assert stored["user_id"] == "user_one" and stored["voice_id"] == vid
+    assert stored["audio_url"] == f"/audio/{j['audio_id']}" and stored["filename"] == f"{j['audio_id']}.wav"
+    assert stored["created_at"] <= stored["completed_at"]
+
     s = client.post("/generate/stream", json={"voice_id": vid, "text": "Hello"})
     assert s.status_code == 200 and s.content[:4] == b"RIFF"
 
     assert client.delete(f"/voices/{vid}").status_code == 204
     assert client.delete(f"/voices/{vid}").status_code == 404
+    assert db.jobs.find_one({"_id": jid}) is None
 
 
 def test_generate_validation(client):
@@ -79,69 +114,66 @@ def test_generate_validation(client):
     assert client.post("/generate", json={"voice_id": "x", "text": "a" * 5000}).status_code == 422
 
 
-def test_auth_required():
-    with TestClient(app) as anon:
-        assert anon.get("/voices").status_code == 401
-        assert anon.get("/auth/me").status_code == 401
-        assert anon.post("/generate", json={"voice_id": "x", "text": "hi"}).status_code == 401
+# The tests below build extra clients without `with`: entering a second TestClient would re-run
+# the app's startup and replace the job queue the module-wide `client` is using.
+def test_every_data_endpoint_requires_auth(client):
+    anon = TestClient(app)
+    assert anon.get("/health").status_code == 200  # the only public route
+    for method, path in [("GET", "/voices"), ("POST", "/voices"), ("PATCH", "/voices/x"), ("DELETE", "/voices/x"),
+                         ("GET", "/voices/x/audio"), ("POST", "/generate"), ("GET", "/jobs/x"),
+                         ("GET", "/audio/x"), ("POST", "/generate/stream")]:
+        assert anon.request(method, path).status_code == 401, (method, path)
+    assert anon.post("/auth/login", json={}).status_code == 404  # the old auth routes are gone
 
 
-def test_signup_validation(client):
-    with TestClient(app) as anon:
-        assert anon.post("/auth/signup", json=ACCOUNT).status_code == 409  # duplicate email, case-insensitive
-        for field, bad in [("email", "nope"), ("phone", "12345"), ("password", "short"),
-                           ("password", "alllowercase123"), ("name", " ")]:
-            r = anon.post("/auth/signup", json={**ACCOUNT, "email": "other@example.com", field: bad})
-            assert r.status_code == 422, (field, r.text)
+def test_rejects_invalid_tokens(client):
+    past = int(time.time()) - 7200
+    bad = {
+        "garbage": {"Authorization": "Bearer not.a.jwt"},
+        "wrong scheme": {"Authorization": f"Basic {token()}"},
+        "signed by another key": bearer(key=OTHER_KEY),
+        "expired": bearer(iat=past, nbf=past, exp=past + 60),
+        "another issuer": bearer(iss="https://evil.example"),
+        "another site (azp)": bearer(azp="https://evil.example"),
+        "no subject": bearer(sub=None),
+        "unsigned": {"Authorization": "Bearer " + jwt.encode({"sub": "user_one", "exp": past + 99999}, None, algorithm="none")},
+        "HS256": {"Authorization": "Bearer " + jwt.encode(
+            {"sub": "user_one", "iss": config.CLERK_ISSUER, "iat": past, "exp": past + 99999}, "x" * 32, algorithm="HS256")},
+    }
+    c = TestClient(app)
+    for why, headers in bad.items():
+        assert c.get("/voices", headers=headers).status_code == 401, why
+    assert c.get("/voices", headers=bearer()).status_code == 200
+    assert c.get("/voices", headers=bearer(azp=None)).status_code == 200  # azp is optional in Clerk tokens
 
 
-def test_login_logout_and_isolation(client):
-    assert client.get("/auth/me").json()["email"] == "test@example.com"
+def test_session_cookie_is_read_only(client):
+    # <audio src> requests carry Clerk's __session cookie instead of a header
+    c = TestClient(app, cookies={"__session": token()})
+    assert c.get("/voices").status_code == 200
+    assert c.post("/generate", json={"voice_id": "x", "text": "hi"}).status_code == 401
+    assert c.delete("/voices/x").status_code == 401
+
+
+def test_users_are_isolated(client):
     vid = upload(client, wav_bytes()).json()["id"]
-    with TestClient(app) as other:
-        assert other.post("/auth/login", json={"email": ACCOUNT["email"], "password": "Wrong!Passw0rd1"}).status_code == 401
-        assert other.post("/auth/login", json={"email": "ghost@example.com", "password": "x"}).status_code == 401
-        r = other.post("/auth/signup", json={**ACCOUNT, "email": "second@example.com"})
-        assert r.status_code == 201 and "password" not in r.text
-        assert other.get("/voices").json() == []
-        assert other.get(f"/voices/{vid}/audio").status_code == 404
-        assert other.delete(f"/voices/{vid}").status_code == 404
-        assert other.post("/generate", json={"voice_id": vid, "text": "hi"}).status_code == 404
-        assert other.post("/auth/logout").status_code == 204
-        assert other.get("/auth/me").status_code == 401
-        assert other.post("/auth/login", json={"email": "SECOND@example.com", "password": ACCOUNT["password"]}).status_code == 200
-        assert other.get("/auth/me").json()["email"] == "second@example.com"
+    job = client.post("/generate", json={"voice_id": vid, "text": "hi"}).json()["job_id"]
+    for _ in range(50):
+        j = client.get(f"/jobs/{job}").json()
+        if j["status"] in ("done", "failed"):
+            break
+        time.sleep(0.1)
+    assert j["status"] == "done", j
+
+    other = TestClient(app, headers=bearer("user_two"))
+    assert other.get("/voices").json() == []
+    assert other.get(f"/voices/{vid}/audio").status_code == 404
+    assert other.patch(f"/voices/{vid}", json={"name": "Mine now"}).status_code == 404
+    assert other.delete(f"/voices/{vid}").status_code == 404
+    assert other.post("/generate", json={"voice_id": vid, "text": "hi"}).status_code == 404
+    assert other.post("/generate/stream", json={"voice_id": vid, "text": "hi"}).status_code == 404
+    assert other.get(f"/jobs/{job}").status_code == 404
+    assert other.get(f"/audio/{j['audio_id']}").status_code == 404
+
+    assert client.get(f"/audio/{j['audio_id']}").status_code == 200
     assert client.delete(f"/voices/{vid}").status_code == 204
-
-
-def test_google_sign_in(monkeypatch):
-    from app import auth, config
-    with TestClient(app) as c:
-        assert c.get("/auth/config").json() == {"google_client_id": None}
-        assert c.post("/auth/google", json={"code": "x"}).status_code == 503
-
-        monkeypatch.setattr(config, "GOOGLE_CLIENT_ID", "cid")
-        monkeypatch.setattr(config, "GOOGLE_CLIENT_SECRET", "secret")
-        claims = {"aud": "cid", "email": "G.User@Example.com", "email_verified": True, "name": "G User"}
-        monkeypatch.setattr(auth, "_google_identity", lambda code: claims)
-        xhr = {"X-Requested-With": "XMLHttpRequest"}
-        assert c.get("/auth/config").json() == {"google_client_id": "cid"}
-        assert c.post("/auth/google", json={"code": "x"}).status_code == 400  # missing CSRF header
-
-        r = c.post("/auth/google", json={"code": "x"}, headers=xhr)
-        assert r.status_code == 200 and r.json()["email"] == "g.user@example.com", r.text
-        uid = r.json()["id"]
-        assert c.get("/auth/me").json()["name"] == "G User"
-        assert c.post("/auth/logout").status_code == 204
-        assert c.post("/auth/google", json={"code": "x"}, headers=xhr).json()["id"] == uid  # same account again
-        # a Google-only account has no password to log in with
-        assert c.post("/auth/login", json={"email": "g.user@example.com", "password": ""}).status_code == 422
-        assert c.post("/auth/login", json={"email": "g.user@example.com", "password": "anything"}).status_code == 401
-
-        # an existing password account with the same verified email is signed into, not duplicated
-        claims.update(email=ACCOUNT["email"])
-        assert c.post("/auth/google", json={"code": "x"}, headers=xhr).json()["name"] == ACCOUNT["name"]
-
-        for bad in ({"aud": "someone-else"}, {"email_verified": False}, {"email": ""}):
-            monkeypatch.setattr(auth, "_google_identity", lambda code, bad=bad: {**claims, **bad})
-            assert c.post("/auth/google", json={"code": "x"}, headers=xhr).status_code == 401, bad
