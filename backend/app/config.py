@@ -11,7 +11,8 @@ GENERATED_DIR = DATA_DIR / "generated"
 
 SAMPLE_RATE = 24000          # XTTS-v2 native rate
 MIN_CLIP_SECONDS = 3.0
-MAX_CLIP_SECONDS = 60.0
+MAX_CLIP_SECONDS = 180.0     # total across all samples of one voice
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # per sample file
 MIN_RMS_DBFS = -45.0         # reject clips quieter than this
 TARGET_RMS_DBFS = -20.0
 MAX_TEXT_CHARS = 1000

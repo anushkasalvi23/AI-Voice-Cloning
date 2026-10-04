@@ -1,4 +1,5 @@
 import io
+import os
 import time
 from types import SimpleNamespace
 
@@ -10,7 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from app import auth, config, db
-from app.main import app
+from app.main import app, cleanup_generated
 
 CLERK_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 OTHER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -121,7 +122,9 @@ def test_every_data_endpoint_requires_auth(client):
     assert anon.get("/health").status_code == 200  # the only public route
     for method, path in [("GET", "/voices"), ("POST", "/voices"), ("PATCH", "/voices/x"), ("DELETE", "/voices/x"),
                          ("GET", "/voices/x/audio"), ("POST", "/generate"), ("GET", "/jobs/x"),
-                         ("GET", "/audio/x"), ("POST", "/generate/stream")]:
+                         ("GET", "/audio/x"), ("POST", "/generate/stream"), ("DELETE", "/jobs/x"),
+                         ("GET", "/clips"), ("POST", "/clips"), ("PATCH", "/clips/x"), ("DELETE", "/clips/x"),
+                         ("GET", "/stats"), ("GET", "/activity"), ("DELETE", "/data?confirm=DELETE")]:
         assert anon.request(method, path).status_code == 401, (method, path)
     assert anon.post("/auth/login", json={}).status_code == 404  # the old auth routes are gone
 
@@ -177,3 +180,113 @@ def test_users_are_isolated(client):
 
     assert client.get(f"/audio/{j['audio_id']}").status_code == 200
     assert client.delete(f"/voices/{vid}").status_code == 204
+
+
+def generate(client, vid, text="Hello there"):
+    jid = client.post("/generate", json={"voice_id": vid, "text": text}).json()["job_id"]
+    for _ in range(50):
+        j = client.get(f"/jobs/{jid}").json()
+        if j["status"] in ("done", "failed"):
+            break
+        time.sleep(0.1)
+    assert j["status"] == "done" and j["duration"] > 0, j
+    return j["audio_id"]
+
+
+def test_multiple_samples_and_size_limit(client):
+    samples = [("files", (f"{i}.wav", wav_bytes(2.0), "audio/wav")) for i in range(3)]  # each too short alone
+    r = client.post("/voices", data={"name": "Joined", "consent": "true"}, files=samples)
+    assert r.status_code == 201, r.text
+    assert r.json()["samples"] == 3 and r.json()["duration"] > 5
+    assert client.delete(f"/voices/{r.json()['id']}").status_code == 204
+
+    assert client.post("/voices", data={"name": "None", "consent": "true"}).status_code == 400
+    assert upload(client, b"x" * (config.MAX_UPLOAD_BYTES + 1)).status_code == 413
+    too_long = [("files", (f"{i}.wav", wav_bytes(50.0), "audio/wav")) for i in range(4)]
+    assert client.post("/voices", data={"name": "Long", "consent": "true"}, files=too_long).status_code == 422
+
+
+def test_library_usage_and_delete_all(client):
+    assert client.delete("/data", params={"confirm": "DELETE"}).status_code == 200  # start from a clean account
+    empty = client.get("/stats").json()
+    assert empty["voices"] == empty["clips"] == empty["storage"]["total"] == 0
+    assert client.get("/activity").json() == [] and client.get("/clips").json() == []
+
+    vid = upload(client, wav_bytes()).json()["id"]
+    fav = client.patch(f"/voices/{vid}", json={"favorite": True})
+    assert fav.status_code == 200 and fav.json()["favorite"] is True and fav.json()["name"] == "Me"
+    assert client.patch(f"/voices/{vid}", json={}).status_code == 422
+
+    aid = generate(client, vid)
+    form = {"audio_id": aid, "name": " Narrator ", "gender": "female", "language": "en", "age": 30}
+    assert client.post("/clips", json={**form, "age": 0}).status_code == 422
+    assert client.post("/clips", json={**form, "gender": "robot"}).status_code == 422
+    assert client.post("/clips", json={**form, "language": "xx"}).status_code == 400
+    assert client.post("/clips", json={**form, "audio_id": "missing"}).status_code == 404
+    saved = client.post("/clips", json=form)
+    assert saved.status_code == 201, saved.text
+    clip = client.get("/clips").json()[0]
+    assert clip == saved.json() and clip["id"] == aid and clip["name"] == "Narrator" and clip["voice_name"] == "Me"
+    assert (clip["gender"], clip["language"], clip["age"], clip["favorite"]) == ("female", "en", 30, False)
+    assert clip["duration"] > 0 and clip["created_at"]
+    assert client.patch(f"/clips/{aid}", json={"favorite": True}).json()["favorite"] is True
+
+    other = TestClient(app, headers=bearer("user_two"))
+    assert other.get("/clips").json() == [] and other.get("/stats").json()["clips"] == 0
+    assert other.post("/clips", json=form).status_code == 404
+    assert other.patch(f"/clips/{aid}", json={"favorite": False}).status_code == 404
+    assert other.delete(f"/clips/{aid}").status_code == 404
+
+    unsaved = generate(client, vid, "Second clip")
+    s = client.get("/stats").json()
+    assert (s["voices"], s["clips"], s["saved_clips"]) == (1, 2, 1)
+    assert s["generated_seconds"] > 0 and s["voice_seconds"] > 4
+    assert all(s["storage"][k] > 0 for k in ("recordings", "embeddings", "generated"))
+    assert s["storage"]["total"] == sum(s["storage"][k] for k in ("recordings", "embeddings", "generated"))
+    feed = client.get("/activity").json()
+    assert [i["type"] for i in feed] == ["clip", "clip", "voice"] and feed[0]["id"] == unsaved
+    assert feed[1]["name"] == "Narrator" and all(i["audio_url"] for i in feed)
+    assert len(client.get("/activity", params={"limit": 1}).json()) == 1
+
+    assert client.delete(f"/clips/{unsaved}").status_code == 204
+    assert client.delete(f"/clips/{unsaved}").status_code == 404
+    assert not (config.GENERATED_DIR / f"{unsaved}.wav").exists()
+
+    assert other.delete("/data", params={"confirm": "DELETE"}).json() == {"voices": 0, "clips": 0}
+    assert client.delete("/data").status_code == 400  # needs the typed confirmation
+    assert client.delete("/data", params={"confirm": "DELETE"}).json() == {"voices": 1, "clips": 1}
+    assert client.get("/voices").json() == [] and client.get("/clips").json() == []
+    assert client.get("/stats").json() == empty
+    assert not (config.VOICES_DIR / vid).exists() and not (config.GENERATED_DIR / f"{aid}.wav").exists()
+    assert db.jobs.count_documents({"user_id": "user_one"}) == 0
+
+
+def test_cancel_job(client):
+    vid = upload(client, wav_bytes()).json()["id"]
+    aid = generate(client, vid)
+    done = db.jobs.find_one({"result_id": aid})["_id"]
+    assert client.delete(f"/jobs/{done}").status_code == 404  # finished jobs are not cancellable
+    assert client.delete("/jobs/nope").status_code == 404
+    # a job removed while queued is skipped by the worker
+    db.jobs.insert_one({"_id": "queuedjob", "user_id": "user_one", "voice_id": vid, "text": "x", "language": "en",
+                        "status": "queued", "error": None, "result_id": None})
+    assert TestClient(app, headers=bearer("user_two")).delete("/jobs/queuedjob").status_code == 404
+    assert client.delete("/jobs/queuedjob").status_code == 204
+    assert client.get("/jobs/queuedjob").status_code == 404
+    assert client.delete(f"/voices/{vid}").status_code == 204
+
+
+def test_saved_clips_survive_cleanup(client):
+    vid = upload(client, wav_bytes()).json()["id"]
+    kept, expired = generate(client, vid), generate(client, vid, "temporary")
+    client.post("/clips", json={"audio_id": kept, "name": "Keep", "gender": "other", "language": "en", "age": 40})
+    old = time.time() - (config.GENERATED_TTL_HOURS + 1) * 3600
+    for a in (kept, expired):
+        os.utime(config.GENERATED_DIR / f"{a}.wav", (old, old))
+    cleanup_generated()
+    assert client.get(f"/audio/{kept}").status_code == 200
+    assert client.get(f"/audio/{expired}").status_code == 404
+    feed = {i["id"]: i["audio_url"] for i in client.get("/activity").json()}
+    assert feed[kept] and feed[expired] is None
+    assert client.delete(f"/voices/{vid}").status_code == 204
+    assert not (config.GENERATED_DIR / f"{kept}.wav").exists()  # deleting a voice removes its clips' audio

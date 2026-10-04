@@ -1,9 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { HandleSSOCallback, useAuth, useUser } from "@clerk/react";
-import { api } from "./api.js";
-import Recorder from "./components/Recorder.jsx";
-import VoiceLibrary from "./components/VoiceLibrary.jsx";
-import GeneratePanel from "./components/GeneratePanel.jsx";
+import Dashboard from "./components/Dashboard.jsx";
 import Landing from "./components/Landing.jsx";
 import Login from "./components/Login.jsx";
 import Signup from "./components/Signup.jsx";
@@ -39,7 +36,8 @@ function Routes() {
   const signedIn = isLoaded ? !!isSignedIn : undefined;
 
   const authPage = route === "#/login" || route === "#/signup";
-  const redirect = signedIn === undefined ? null : authPage && signedIn ? "#/app" : route === "#/app" && !signedIn ? "#/login" : null;
+  const appPage = route === "#/app" || route.startsWith("#/app/"); // the dashboard owns everything under #/app
+  const redirect = signedIn === undefined ? null : authPage && signedIn ? "#/app" : appPage && !signedIn ? "#/login" : null;
   useEffect(() => {
     if (redirect) window.location.replace(redirect);
   }, [redirect]);
@@ -51,47 +49,10 @@ function Routes() {
     await signOut().catch(() => {});
   };
 
-  if (!authPage && route !== "#/app") return <Landing />;
+  if (!authPage && !appPage) return <Landing />;
   if (signedIn === undefined || redirect || (signedIn && !user)) return null;
   if (route === "#/login") return <Login onAuth={enterApp} />;
   if (route === "#/signup") return <Signup onAuth={enterApp} />;
-  const name = user.fullName || user.primaryEmailAddress?.emailAddress;
-  return <Studio user={{ name }} onLogout={logout} onExpired={onExpired} />;
-}
-
-function Studio({ user, onLogout, onExpired }) {
-  const [voices, setVoices] = useState([]);
-  const [selected, setSelected] = useState(null);
-  const [languages, setLanguages] = useState(["en"]);
-  const [error, setError] = useState("");
-
-  const refresh = useCallback(async () => {
-    try {
-      const list = await api.listVoices();
-      setVoices(list);
-      setSelected((s) => (list.some((v) => v.id === s) ? s : list[0]?.id ?? null));
-    } catch (e) {
-      if (e.status === 401) return onExpired();
-      setError(`Cannot reach the backend: ${e.message}`);
-    }
-  }, [onExpired]);
-
-  useEffect(() => {
-    refresh();
-    api.health().then((h) => setLanguages(h.languages)).catch(() => {});
-  }, [refresh]);
-
-  return (
-    <main>
-      <div className="row">
-        <h1 className="grow">Voice Cloning</h1>
-        <small>{user.name}</small>
-        <button className="secondary" onClick={onLogout}>Log out</button>
-      </div>
-      {error && <p className="error">{error}</p>}
-      <Recorder languages={languages} onSaved={(v) => { setSelected(v.id); refresh(); }} />
-      <VoiceLibrary voices={voices} selectedId={selected} onSelect={setSelected} onChanged={refresh} />
-      <GeneratePanel voices={voices} voiceId={selected} onVoice={setSelected} languages={languages} />
-    </main>
-  );
+  const name = user.fullName || user.primaryEmailAddress?.emailAddress || "Eva user";
+  return <Dashboard route={route} user={{ name }} onLogout={logout} onExpired={onExpired} />;
 }
